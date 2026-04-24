@@ -201,11 +201,12 @@ async def radar_task():
             temp_symbols = []
             
             for sym, m in exchange.markets.items():
-                if m.get('type') != 'swap' or not m.get('active'): continue
+                if m.get('active') is False: continue
+                if not (sym.endswith(':USD') or sym.endswith(':USDT')): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: continue
                 
-                stats['total'] += 1 
+                stats['total'] += 1
                 
                 tick = tickers.get(sym)
                 # ИСПРАВЛЕННЫЙ БЛОК проверки NoneType
