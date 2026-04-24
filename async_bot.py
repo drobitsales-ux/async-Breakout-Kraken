@@ -360,8 +360,12 @@ def run_server():
 async def main():
     init_db(); load_positions()
     logging.info("🚀 Запуск KRAKEN ASYNC БОТА (Trading Enabled, Prop Firm Risk, HTML Telegram)...")
+    
+    # === ДОБАВЛЯЕМ СТАРТОВОЕ СООБЩЕНИЕ ===
+    await send_tg_msg("🟢 <b>KRAKEN ASYNC БОТ</b> успешно запущен и готов к работе!")
+    
     Thread(target=run_server, daemon=True).start()
-    asyncio.create_task(monitor_positions_task()) # Запускаем параллельный мониторинг позиций
+    asyncio.create_task(monitor_positions_task()) 
     asyncio.create_task(print_stats_hourly())
     await radar_task()
 
