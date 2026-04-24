@@ -105,7 +105,8 @@ def load_positions():
 async def send_tg_msg(text):
     if not TOKEN: return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    # Меняем парсер на стабильный HTML
+    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp: pass
@@ -251,7 +252,8 @@ async def radar_task():
                     new_hot_list[sym] = signal
                     if sym not in HOT_LIST and sym not in NOTIFIED_SYMBOLS:
                         NOTIFIED_SYMBOLS.add(sym)
-                        await send_tg_msg(f"🎯 **РАДАР [{signal['mode']}]:** {sym.split(':')[0]} взят на мушку! (24h Vol: {signal['vol_24h']/1000000:.1f}M)")
+                        # Используем HTML-теги для жирного текста
+                        await send_tg_msg(f"🎯 <b>РАДАР [{signal['mode']}]:</b> {sym.split(':')[0]} взят на мушку! (24h Vol: {signal['vol_24h']/1000000:.1f}M)")
 
             HOT_LIST = new_hot_list
             NOTIFIED_SYMBOLS = {s for s in NOTIFIED_SYMBOLS if s in HOT_LIST}
