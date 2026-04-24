@@ -15,7 +15,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # === НАСТРОЙКИ PROP FIRM (Breakout / Kraken) ===
 DB_PATH = 'bot_prop.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', 0)) 
+raw_id = str(os.getenv('GROUP_CHAT_ID', '')).strip()
+try:
+    GROUP_CHAT_ID = int(raw_id)
+except ValueError:
+    GROUP_CHAT_ID = raw_id 
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
 KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
