@@ -16,7 +16,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # === НАСТРОЙКИ PROP FIRM (Breakout / Kraken) ===
 DB_PATH = 'bot_prop.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID')) # Замени в Render на ID новой группы
+# Добавили значение по умолчанию "0", чтобы избежать ошибки NoneType
+GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', 0)) 
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
 KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
@@ -67,12 +68,14 @@ def get_mem_usage():
     except: pass
     return "N/A"
 
-# === ЕДИНСТВЕННАЯ ИНИЦИАЛИЗАЦИЯ БИРЖИ KRAKEN ===
+# === ИНИЦИАЛИЗАЦИЯ БИРЖИ KRAKEN (АСИНХРОННАЯ) ===
 exchange = ccxt_async.krakenfutures({
     'apiKey': KRAKEN_API_KEY, 
     'secret': KRAKEN_SECRET,
     'enableRateLimit': True
 })
+# ВАЖНО: Включаем демо-сервер (Sandbox) для тестирования!
+exchange.set_sandbox_mode(True)
 
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
