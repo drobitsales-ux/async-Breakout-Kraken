@@ -24,7 +24,9 @@ RISK_PER_TRADE = 0.005      # РИСК 0.5%
 MAX_POSITIONS = 3           
 LEVERAGE = 5                
 MAX_SPREAD_PERCENT = 0.002  
-MIN_VOLUME_USDT = 1000000  
+MIN_VOLUME_USDT = 1000000
+MIN_NOTIONAL_USDT = 10.0    
+WHALE_VOLUME_MULTIPLIER = 8.0 
 
 # === ИНИЦИАЛИЗАЦИЯ БИРЖИ KRAKEN (АСИНХРОННАЯ) ===
 exchange = ccxt_async.krakenfutures({
@@ -32,8 +34,6 @@ exchange = ccxt_async.krakenfutures({
     'secret': KRAKEN_SECRET,
     'enableRateLimit': True
 })
-MIN_NOTIONAL_USDT = 10.0    
-WHALE_VOLUME_MULTIPLIER = 8.0 
 
 SMC_TIMEFRAME = '15m'
 
