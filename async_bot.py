@@ -257,7 +257,11 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
                     active_fvg = fvg; break
             
             if not active_fvg or not bos_choch: return sym, None
+            
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
+            
+            if not mode: return sym, None  # <--- ВОТ ЭТА ЗАЩИТА ОТ NONE
+            
             if mode == 'Long' and btc_trend != 'Long': return sym, None
             if mode == 'Short' and btc_trend != 'Short': return sym, None
 
