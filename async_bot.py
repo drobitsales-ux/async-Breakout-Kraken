@@ -13,18 +13,25 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# === НАСТРОЙКИ v8.33 (1h Telemetry Logging & USDC Filter) ===
-DB_PATH = 'bot.db' 
+# === НАСТРОЙКИ PROP FIRM (Breakout / Kraken) ===
+DB_PATH = 'bot_prop.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
-BINGX_API_KEY = os.getenv('BINGX_API_KEY')
-BINGX_SECRET = os.getenv('BINGX_SECRET')
+GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID'))
+KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
+KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
-RISK_PER_TRADE = 0.02      
+RISK_PER_TRADE = 0.005      # РИСК 0.5%
 MAX_POSITIONS = 3           
-LEVERAGE = 10               
+LEVERAGE = 5                
 MAX_SPREAD_PERCENT = 0.002  
 MIN_VOLUME_USDT = 1000000  
+
+# === ИНИЦИАЛИЗАЦИЯ БИРЖИ KRAKEN (АСИНХРОННАЯ) ===
+exchange = ccxt_async.krakenfutures({
+    'apiKey': KRAKEN_API_KEY, 
+    'secret': KRAKEN_SECRET,
+    'enableRateLimit': True
+})
 MIN_NOTIONAL_USDT = 10.0    
 WHALE_VOLUME_MULTIPLIER = 8.0 
 
