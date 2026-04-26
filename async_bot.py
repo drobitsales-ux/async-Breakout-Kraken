@@ -15,29 +15,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # === НАСТРОЙКИ PROP FIRM (Breakout / Kraken) ===
 DB_PATH = 'bot_prop.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID = -1003955653290  # <--- ПРОСТО ВПИШИ ЦИФРЫ СЮДА
+GROUP_CHAT_ID = -1003955653290
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
 KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
-RISK_PER_TRADE = 0.005      # РИСК 0.5%
+RISK_PER_TRADE = 0.005      
 MAX_POSITIONS = 3           
 LEVERAGE = 5                
-MAX_SPREAD_PERCENT = 1.0    # ДЛЯ ДЕМО
-MIN_VOLUME_USDT = 0         # ДЛЯ ДЕМО
+MAX_SPREAD_PERCENT = 1.0    
+MIN_VOLUME_USDT = 0         
+MIN_SL_PCT = 1.0            
+MAX_SL_PCT = 5.0            
+
 SMC_TIMEFRAME = '15m'
 COOLDOWN_CACHE = {}         
 SCAN_LIMIT = 300           
 
-# СОКРАЩЕННЫЙ СПИСОК (Для Демо сервера)
 EXCLUDED_KEYWORDS = [
     'FART', 'PEPE', 'SHIB', 'DOGE', 'WIF', 'BONK', 'FLOKI', 'BOME',
     'MEME', 'TURBO', 'SATS', 'RATS', 'ORDI', 'PEOPLE'
 ]
 
-daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': 0.0}
+daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': 0.0, 'start_balance': 0.0}
 active_positions = []
-HOT_LIST = {}  
 NOTIFIED_SYMBOLS = set() 
+REPORTED_TODAY = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
@@ -49,13 +51,12 @@ def get_mem_usage():
     except: pass
     return "N/A"
 
-# === ИНИЦИАЛИЗАЦИЯ БИРЖИ KRAKEN ===
 exchange = ccxt_async.krakenfutures({
     'apiKey': KRAKEN_API_KEY, 
     'secret': KRAKEN_SECRET,
     'enableRateLimit': True
 })
-exchange.set_sandbox_mode(True) # ДЕМО РЕЖИМ
+exchange.set_sandbox_mode(True) 
 
 def get_db_conn(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -67,13 +68,16 @@ def init_db():
     except: pass
     try: c.execute("ALTER TABLE daily_stats ADD COLUMN prev_winrate REAL DEFAULT 0.0")
     except: pass
+    try: c.execute("ALTER TABLE daily_stats ADD COLUMN start_balance REAL DEFAULT 0.0")
+    except: pass
     conn.commit(); conn.close()
 
 def save_positions():
     conn = get_db_conn(); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO active_positions (id, data) VALUES (1, ?)", (json.dumps(active_positions),))
-    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins, prev_winrate) VALUES (1, ?, ?, ?, ?)", 
-              (daily_stats.get('pnl', 0.0), daily_stats.get('trades', 0), daily_stats.get('wins', 0), daily_stats.get('prev_winrate', 0.0)))
+    c.execute("INSERT OR REPLACE INTO daily_stats (id, pnl, trades, wins, prev_winrate, start_balance) VALUES (1, ?, ?, ?, ?, ?)", 
+              (daily_stats.get('pnl', 0.0), daily_stats.get('trades', 0), daily_stats.get('wins', 0), 
+               daily_stats.get('prev_winrate', 0.0), daily_stats.get('start_balance', 0.0)))
     conn.commit(); conn.close()
 
 def load_positions():
@@ -82,16 +86,17 @@ def load_positions():
         conn = get_db_conn(); c = conn.cursor()
         c.execute("SELECT data FROM active_positions WHERE id = 1"); row = c.fetchone()
         if row: active_positions = json.loads(row[0])
-        c.execute("SELECT pnl, trades, wins, prev_winrate FROM daily_stats WHERE id = 1")
+        c.execute("SELECT pnl, trades, wins, prev_winrate, start_balance FROM daily_stats WHERE id = 1")
         stat_row = c.fetchone()
-        if stat_row: daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'] = stat_row
+        if stat_row: 
+            daily_stats['pnl'], daily_stats['trades'], daily_stats['wins'], daily_stats['prev_winrate'], daily_stats['start_balance'] = stat_row
         conn.close()
     except Exception: pass
 
 async def send_tg_msg(text):
-    if not TOKEN or GROUP_CHAT_ID == 0: return
+    if not TOKEN: return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "HTML"} # ИСПОЛЬЗУЕМ HTML
+    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "HTML"} 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp: pass
@@ -126,28 +131,31 @@ def analyze_structure(h, l, c):
         elif trend == 'Bullish' and c[-1] < recent[-1]['price']: bos_choch = 'CHoCH_Bearish'
     return trend, bos_choch
 
-# === ТОРГОВЫЙ МОДУЛЬ (ДОБАВЛЕН) ===
 async def execute_trade(sym, direction, current_price, sl_price, tp_price):
-    global active_positions
+    global active_positions, COOLDOWN_CACHE
     if len(active_positions) >= MAX_POSITIONS or any(p['symbol'] == sym for p in active_positions): return
     if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: return
         
     try:
         bal = await exchange.fetch_balance()
-        # Поддержка USD для демо и USDT для реала
         free_usd = float(bal.get('USDT', {}).get('free', 0)) or float(bal.get('USD', {}).get('free', 0))
         if free_usd <= 0: return
 
         actual_sl_dist = abs(current_price - sl_price)
         if actual_sl_dist <= 0: return
-        risk_amount = free_usd * RISK_PER_TRADE
         
+        sl_pct = (actual_sl_dist / current_price) * 100
+        if sl_pct > MAX_SL_PCT:
+            logging.info(f"Отмена входа {sym}: Слишком широкий SL ({sl_pct:.1f}%)")
+            COOLDOWN_CACHE[sym] = time.time() + 3600
+            return
+            
+        risk_amount = free_usd * RISK_PER_TRADE
         market = exchange.markets[sym]
         contract_size = float(market.get('contractSize', 1.0))
         
         qty_coins = risk_amount / actual_sl_dist
-        qty = qty_coins / contract_size if contract_size > 0 else qty_coins
-        qty = float(exchange.amount_to_precision(sym, qty))
+        qty = float(exchange.amount_to_precision(sym, qty_coins / contract_size if contract_size > 0 else qty_coins))
         if qty <= 0: return
         
         try: await exchange.set_leverage(LEVERAGE, sym)
@@ -166,7 +174,6 @@ async def execute_trade(sym, direction, current_price, sl_price, tp_price):
         })
         await asyncio.to_thread(save_positions)
         
-        sl_pct = (actual_sl_dist / current_price) * 100
         await send_tg_msg(f"💥 <b>ВЫСТРЕЛ [SMC Async]: {sym.split(':')[0]}</b>\nНаправление: <b>#{direction}</b>\n\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
     except Exception as e: 
         logging.error(f"Trade execution error {sym}: {e}")
@@ -193,10 +200,11 @@ async def monitor_positions_task():
                 if not curr:
                     pnl = (ticker - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - ticker) * pos['initial_qty']
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
+                    daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                     
                     if pnl > 0: 
                         daily_stats['wins'] = daily_stats.get('wins', 0) + 1
-                        await send_tg_msg(f"✅ <b>{clean_name} закрыта в плюс!</b>\nPNL: +{pnl:.2f} USD")
+                        await send_tg_msg(f"✅ <b>{clean_name} закрыта в плюс!</b>\nPNL: {pnl:+.2f} USD")
                     else: 
                         COOLDOWN_CACHE[sym] = time.time() + 14400
                         await send_tg_msg(f"🛑 <b>{clean_name} выбита по SL.</b>\nPNL: {pnl:.2f} USD\n❄️ Монета заморожена.")
@@ -211,20 +219,21 @@ async def monitor_positions_task():
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']))
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1
+                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                         if pnl > 0: daily_stats['wins'] = daily_stats.get('wins', 0) + 1
                         else: COOLDOWN_CACHE[sym] = time.time() + 14400
-                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:.2f} USD")
+                        await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USD")
                         continue
                     except: pass
 
-                # Проверка тейк-профита
                 if (is_long and ticker >= pos['tp1']) or (not is_long and ticker <= pos['tp1']):
                     try:
                         await exchange.create_market_order(sym, 'sell' if is_long else 'buy', float(curr['contracts']))
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                         daily_stats['wins'] = daily_stats.get('wins', 0) + 1
-                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: +{pnl:.2f} USD")
+                        daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
+                        await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USD")
                         continue
                     except: pass
 
@@ -259,20 +268,20 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
             if not active_fvg or not bos_choch: return sym, None
             
             mode = 'Long' if bos_choch == 'CHoCH_Bullish' and active_fvg['type'] == 'Bullish' else 'Short' if bos_choch == 'CHoCH_Bearish' and active_fvg['type'] == 'Bearish' else None
-            
-            if not mode: return sym, None  # <--- ВОТ ЭТА ЗАЩИТА ОТ NONE
+            if not mode: return sym, None
             
             if mode == 'Long' and btc_trend != 'Long': return sym, None
             if mode == 'Short' and btc_trend != 'Short': return sym, None
 
-            # РАСЧЕТ SL и TP по Smart Money
             if mode == 'Long':
                 sl_price = min(l[active_fvg['index']:]) * 0.998
-                if sl_price >= current_price: sl_price = current_price * 0.99
+                if (current_price - sl_price) / current_price * 100 < MIN_SL_PCT:
+                    sl_price = current_price * (1 - MIN_SL_PCT/100)
                 tp_price = current_price + (current_price - sl_price) * 1.5
             else:
                 sl_price = max(h[active_fvg['index']:]) * 1.002
-                if sl_price <= current_price: sl_price = current_price * 1.01
+                if (sl_price - current_price) / current_price * 100 < MIN_SL_PCT:
+                    sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
             signal = {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'vol_24h': q_vol, 'fvg': active_fvg}
@@ -280,7 +289,7 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
         except: return sym, None
 
 async def radar_task():
-    global HOT_LIST, NOTIFIED_SYMBOLS
+    global NOTIFIED_SYMBOLS
     await exchange.load_markets() 
     await asyncio.sleep(5)
     while True:
@@ -335,21 +344,49 @@ async def radar_task():
                 if sym not in NOTIFIED_SYMBOLS:
                     NOTIFIED_SYMBOLS.add(sym)
                     await send_tg_msg(f"🎯 <b>РАДАР [{signal['mode']}]:</b> {sym.split(':')[0]} найден сетап!")
-                    # Открываем сделку на бирже!
                     await execute_trade(sym, signal['mode'], signal['price'], signal['sl_price'], signal['tp_price'])
 
-            logging.info(f"🔎 [РАДАР] Скан завершен. На мушке: {len(valid_results)} | ОЗУ: {get_mem_usage()} | BTC Vol: {btc_volatility_pct:.2f}%")
             gc.collect(); await asyncio.sleep(60) 
         except Exception as e: 
             logging.error(f"Radar Loop Error: {e}"); await asyncio.sleep(60)
 
 async def print_stats_hourly():
-    global daily_stats
+    global daily_stats, REPORTED_TODAY
     while True:
         try:
-            winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats.get('trades', 0) > 0 else 0
+            now = datetime.now(timezone.utc)
+            trades = daily_stats.get('trades', 0)
+            winrate = (daily_stats['wins'] / trades * 100) if trades > 0 else 0
+            pnl = daily_stats.get('pnl', 0.0)
+            
             active = ", ".join([f"{p['symbol'].split(':')[0]}" for p in active_positions]) or "Нет"
-            logging.info(f"📊 [СТАТИСТИКА] Сделок: {daily_stats.get('trades', 0)} | Винрейт: {winrate:.1f}% | Открыто: {active}")
+            logging.info(f"📊 [СТАТИСТИКА] Сделок: {trades} | Винрейт: {winrate:.1f}% | PNL: {pnl:+.2f}$ | Открыто: {active}")
+            
+            if now.hour == 20 and not REPORTED_TODAY:
+                bal = await exchange.fetch_balance()
+                current_balance = float(bal.get('USDT', {}).get('total', 0)) or float(bal.get('USD', {}).get('total', 0))
+                
+                start_bal = daily_stats.get('start_balance', 0.0)
+                pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
+                
+                report = (
+                    f"🗓 <b>ИТОГИ ДНЯ (SMC Async Bot):</b> {now.strftime('%d.%m.%Y')}\n\n"
+                    f"📉 Закрыто сделок: {trades}\n"
+                    f"🎯 Винрейт: {winrate:.1f}%\n"
+                    f"💵 PNL сделок: {pnl:+.2f} USD\n\n"
+                    f"🏦 <b>Баланс аккаунта:</b> {current_balance:.2f} USD\n"
+                    f"📊 <b>Изменение за день:</b> {pct_change:+.2f}%\n\n"
+                    f"<i>*Сделок в работе: {len(active_positions)}</i>"
+                )
+                await send_tg_msg(report)
+                
+                daily_stats['prev_winrate'] = winrate; daily_stats['pnl'] = 0.0; daily_stats['trades'] = 0; daily_stats['wins'] = 0
+                daily_stats['start_balance'] = current_balance
+                await asyncio.to_thread(save_positions)
+                REPORTED_TODAY = True
+            elif now.hour != 20:
+                REPORTED_TODAY = False
+                
         except: pass
         await asyncio.sleep(3600)
 
@@ -363,9 +400,17 @@ def run_server():
 
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск KRAKEN ASYNC БОТА (Trading Enabled, Prop Firm Risk, HTML Telegram)...")
     
-    # === ДОБАВЛЯЕМ СТАРТОВОЕ СООБЩЕНИЕ ===
+    # Фиксируем баланс при первом запуске
+    if daily_stats.get('start_balance', 0.0) == 0.0:
+        try:
+            bal = await exchange.fetch_balance()
+            curr = float(bal.get('USDT', {}).get('total', 0)) or float(bal.get('USD', {}).get('total', 0))
+            daily_stats['start_balance'] = curr
+            await asyncio.to_thread(save_positions)
+        except: pass
+        
+    logging.info("🚀 Запуск KRAKEN ASYNC БОТА (Trading Enabled, Prop Firm Risk, HTML Telegram)...")
     await send_tg_msg("🟢 <b>KRAKEN ASYNC БОТ</b> успешно запущен и готов к работе!")
     
     Thread(target=run_server, daemon=True).start()
