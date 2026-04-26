@@ -22,8 +22,6 @@ KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 RISK_PER_TRADE = 0.005      
 MAX_POSITIONS = 3           
 LEVERAGE = 5                
-MAX_SPREAD_PERCENT = 1.0    
-MIN_VOLUME_USDT = 0         
 MIN_SL_PCT = 1.0            
 MAX_SL_PCT = 5.0            
 
@@ -131,11 +129,13 @@ def analyze_structure(h, l, c):
         elif trend == 'Bullish' and c[-1] < recent[-1]['price']: bos_choch = 'CHoCH_Bearish'
     return trend, bos_choch
 
-async def execute_trade(sym, direction, current_price, sl_price, tp_price):
+async def execute_trade(sym, signal_data):
     global active_positions, COOLDOWN_CACHE
     if len(active_positions) >= MAX_POSITIONS or any(p['symbol'] == sym for p in active_positions): return
     if sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[sym]: return
         
+    direction, current_price, sl_price, tp_price = signal_data['mode'], signal_data['price'], signal_data['sl_price'], signal_data['tp_price']
+    
     try:
         bal = await exchange.fetch_balance()
         free_usd = float(bal.get('USDT', {}).get('free', 0)) or float(bal.get('USD', {}).get('free', 0))
@@ -146,7 +146,6 @@ async def execute_trade(sym, direction, current_price, sl_price, tp_price):
         
         sl_pct = (actual_sl_dist / current_price) * 100
         if sl_pct > MAX_SL_PCT:
-            logging.info(f"Отмена входа {sym}: Слишком широкий SL ({sl_pct:.1f}%)")
             COOLDOWN_CACHE[sym] = time.time() + 3600
             return
             
@@ -174,7 +173,21 @@ async def execute_trade(sym, direction, current_price, sl_price, tp_price):
         })
         await asyncio.to_thread(save_positions)
         
-        await send_tg_msg(f"💥 <b>ВЫСТРЕЛ [SMC Async]: {sym.split(':')[0]}</b>\nНаправление: <b>#{direction}</b>\n\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\nTP: {tp_price}")
+        # === ОТПРАВКА СООБЩЕНИЯ С АНАЛИТИКОЙ ===
+        msg = (
+            f"💥 <b>ВЫСТРЕЛ [SMC Async]: {sym.split(':')[0]}</b>\n"
+            f"Направление: <b>#{direction}</b>\n\n"
+            f"Цена: {current_price}\n"
+            f"Объем (контр.): {qty}\n"
+            f"SL: {sl_price} ({sl_pct:.2f}%)\n"
+            f"TP: {tp_price}\n\n"
+            f"📊 <b>Аналитика сетапа:</b>\n"
+            f"🔸 Размер FVG: {signal_data['fvg_size']:.2f}%\n"
+            f"🔸 Отклон. от EMA200: {signal_data['ema_dist']:.2f}%\n"
+            f"🔸 BTC Тренд: {signal_data['btc_trend']}\n"
+            f"🔸 Объем 24ч: {signal_data['vol_24h']/1000000:.1f}M$"
+        )
+        await send_tg_msg(msg)
     except Exception as e: 
         logging.error(f"Trade execution error {sym}: {e}")
 
@@ -197,8 +210,12 @@ async def monitor_positions_task():
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 
+                market = exchange.markets.get(sym, {})
+                contract_size = float(market.get('contractSize', 1.0))
+                
                 if not curr:
-                    pnl = (ticker - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - ticker) * pos['initial_qty']
+                    # ИСПРАВЛЕНА ФОРМУЛА PNL (Добавлен contract_size)
+                    pnl = (ticker - pos['entry_price']) * pos['initial_qty'] * contract_size if is_long else (pos['entry_price'] - ticker) * pos['initial_qty'] * contract_size
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                     daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
                     
@@ -212,7 +229,9 @@ async def monitor_positions_task():
 
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
-                pnl = (ticker - pos['entry_price']) * float(curr['contracts']) if is_long else (pos['entry_price'] - ticker) * float(curr['contracts'])
+                
+                # ИСПРАВЛЕНА ФОРМУЛА PNL
+                pnl = (ticker - pos['entry_price']) * float(curr['contracts']) * contract_size if is_long else (pos['entry_price'] - ticker) * float(curr['contracts']) * contract_size
 
                 if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
                     try:
@@ -248,7 +267,7 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
     async with sem:
         try:
             await asyncio.sleep(0.3)
-            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=100)
+            ohlcv = await exchange.fetch_ohlcv(sym, timeframe=SMC_TIMEFRAME, limit=200)
             if not ohlcv or len(ohlcv) < 50: return sym, None
             
             o = np.array([x[1] for x in ohlcv], dtype=float)
@@ -259,6 +278,7 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
             trend, bos_choch = analyze_structure(h, l, c)
             fvgs = analyze_fvg(o, h, l, c)
             current_price = c[-1]
+            ema200 = calculate_ema(c, 200)
             
             active_fvg = None
             for fvg in reversed(fvgs):
@@ -284,7 +304,14 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
                     sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            signal = {'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 'vol_24h': q_vol, 'fvg': active_fvg}
+            # СОБИРАЕМ АНАЛИТИКУ
+            fvg_size = abs(active_fvg['top'] - active_fvg['bottom']) / current_price * 100
+            ema_dist = abs(current_price - ema200) / current_price * 100
+
+            signal = {
+                'mode': mode, 'price': current_price, 'sl_price': sl_price, 'tp_price': tp_price, 
+                'vol_24h': q_vol, 'fvg_size': fvg_size, 'ema_dist': ema_dist, 'btc_trend': btc_trend
+            }
             return sym, signal
         except: return sym, None
 
@@ -343,8 +370,7 @@ async def radar_task():
                 sym, signal = res
                 if sym not in NOTIFIED_SYMBOLS:
                     NOTIFIED_SYMBOLS.add(sym)
-                    await send_tg_msg(f"🎯 <b>РАДАР [{signal['mode']}]:</b> {sym.split(':')[0]} найден сетап!")
-                    await execute_trade(sym, signal['mode'], signal['price'], signal['sl_price'], signal['tp_price'])
+                    await execute_trade(sym, signal)
 
             gc.collect(); await asyncio.sleep(60) 
         except Exception as e: 
@@ -401,7 +427,6 @@ def run_server():
 async def main():
     init_db(); load_positions()
     
-    # Фиксируем баланс при первом запуске
     if daily_stats.get('start_balance', 0.0) == 0.0:
         try:
             bal = await exchange.fetch_balance()
