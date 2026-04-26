@@ -22,6 +22,8 @@ KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 RISK_PER_TRADE = 0.005      
 MAX_POSITIONS = 3           
 LEVERAGE = 5                
+MAX_SPREAD_PERCENT = 1.0    
+MIN_VOLUME_USDT = 0         
 MIN_SL_PCT = 1.0            
 MAX_SL_PCT = 5.0            
 
@@ -146,6 +148,7 @@ async def execute_trade(sym, signal_data):
         
         sl_pct = (actual_sl_dist / current_price) * 100
         if sl_pct > MAX_SL_PCT:
+            logging.info(f"Отмена входа {sym}: Слишком широкий SL ({sl_pct:.1f}%)")
             COOLDOWN_CACHE[sym] = time.time() + 3600
             return
             
@@ -173,7 +176,7 @@ async def execute_trade(sym, signal_data):
         })
         await asyncio.to_thread(save_positions)
         
-        # === ОТПРАВКА СООБЩЕНИЯ С АНАЛИТИКОЙ ===
+        # АНАЛИТИКА
         msg = (
             f"💥 <b>ВЫСТРЕЛ [SMC Async]: {sym.split(':')[0]}</b>\n"
             f"Направление: <b>#{direction}</b>\n\n"
@@ -214,7 +217,7 @@ async def monitor_positions_task():
                 contract_size = float(market.get('contractSize', 1.0))
                 
                 if not curr:
-                    # ИСПРАВЛЕНА ФОРМУЛА PNL (Добавлен contract_size)
+                    # ИСПРАВЛЕНА ОШИБКА: ДОБАВЛЕН CONTRACT SIZE В PNL
                     pnl = (ticker - pos['entry_price']) * pos['initial_qty'] * contract_size if is_long else (pos['entry_price'] - ticker) * pos['initial_qty'] * contract_size
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
                     daily_stats['pnl'] = daily_stats.get('pnl', 0.0) + pnl
@@ -230,7 +233,7 @@ async def monitor_positions_task():
                 if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 
-                # ИСПРАВЛЕНА ФОРМУЛА PNL
+                # ИСПРАВЛЕНА ОШИБКА: ДОБАВЛЕН CONTRACT SIZE В PNL
                 pnl = (ticker - pos['entry_price']) * float(curr['contracts']) * contract_size if is_long else (pos['entry_price'] - ticker) * float(curr['contracts']) * contract_size
 
                 if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
@@ -304,7 +307,6 @@ async def process_single_coin(sym, btc_trend, q_vol, sem):
                     sl_price = current_price * (1 + MIN_SL_PCT/100)
                 tp_price = current_price - (sl_price - current_price) * 1.5
 
-            # СОБИРАЕМ АНАЛИТИКУ
             fvg_size = abs(active_fvg['top'] - active_fvg['bottom']) / current_price * 100
             ema_dist = abs(current_price - ema200) / current_price * 100
 
