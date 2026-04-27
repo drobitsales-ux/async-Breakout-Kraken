@@ -10,16 +10,15 @@ import numpy as np
 import aiohttp
 from datetime import datetime, timezone
 
-# === НАСТРОЙКИ PROP FIRM (Kraken Real) ===
 DB_PATH = 'bot_prop.db' 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = -1003955653290
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
 KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
-RISK_PER_TRADE = 0.005      # 0.5% РИСК ДЛЯ ПРОПА
-MAX_POSITIONS = 3           
-LEVERAGE = 5                # ПЛЕЧО х5
+RISK_PER_TRADE = 0.005      # ПРОП РИСК 0.5%
+MAX_POSITIONS = 3           # ЛИМИТ 3 СДЕЛКИ
+LEVERAGE = 5                
 MIN_SL_PCT = 1.0            
 MAX_SL_PCT = 5.0            
 
@@ -63,7 +62,6 @@ async def execute_trade(sym, signal_data):
         actual_sl_dist = abs(current_price - sl_price)
         qty_coins = (free_usd * RISK_PER_TRADE) / actual_sl_dist
         
-        # Маржинальный предохранитель Кракен
         target_notional = qty_coins * current_price
         allowed_notional = free_usd * LEVERAGE * 0.90 
         if target_notional > allowed_notional: qty_coins = allowed_notional / current_price
@@ -77,12 +75,11 @@ async def execute_trade(sym, signal_data):
         side = 'buy' if direction == 'Long' else 'sell'; sl_side = 'sell' if direction == 'Long' else 'buy'
         
         await exchange.create_market_order(sym, side, qty)
-        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'stopLossPrice': sl_price})
+        sl_ord = await exchange.create_order(sym, 'stop_market', sl_side, qty, params={'stopLossPrice': sl_price, 'reduceOnly': True})
         
         active_positions.append({'symbol': sym, 'direction': direction, 'entry_price': current_price, 'initial_qty': qty, 'sl_price': sl_price, 'tp1': tp_price, 'sl_order_id': sl_ord['id'], 'open_time': datetime.now(timezone.utc).isoformat()})
         await asyncio.to_thread(save_positions)
-        
-        await send_tg_msg(f"💥 <b>ВЫСТРЕЛ [SMC Async PROP]: {sym.split(':')[0]}</b>\nНаправление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price}\nTP: {tp_price}")
+        await send_tg_msg(f"💥 <b>ВЫСТРЕЛ [SMC Async KRAKEN]: {sym.split(':')[0]}</b>\nНаправление: <b>#{direction}</b>\nЦена: {current_price}\nОбъем: {qty}\nSL: {sl_price}\nTP: {tp_price}")
     except Exception as e: logging.error(f"Trade execution error {sym}: {e}")
 
 async def monitor_positions_task():
@@ -98,7 +95,6 @@ async def monitor_positions_task():
                 curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 
-                # Идеально чистый расчет PNL через initial_qty
                 if not curr:
                     pnl = (pos['sl_price'] - pos['entry_price']) * pos['initial_qty'] if is_long else (pos['entry_price'] - pos['sl_price']) * pos['initial_qty']
                     COOLDOWN_CACHE[sym] = time.time() + 14400
@@ -109,7 +105,7 @@ async def monitor_positions_task():
 
                 if hours_passed >= 3.0 or (hours_passed >= 1.5 and pnl > 0):
                     try:
-                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'])
+                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         if pnl < 0: COOLDOWN_CACHE[sym] = time.time() + 14400
                         await send_tg_msg(f"{'✅' if pnl > 0 else '🛑'} <b>{clean_name} закрыта по ТАЙМАУТУ!</b>\nPNL: {pnl:+.2f} USD"); continue
@@ -117,7 +113,7 @@ async def monitor_positions_task():
 
                 if (is_long and ticker >= pos['tp1']) or (not is_long and ticker <= pos['tp1']):
                     try:
-                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'])
+                        await exchange.create_market_order(sym, 'sell' if is_long else 'buy', pos['initial_qty'], params={'reduceOnly': True})
                         if pos.get('sl_order_id'): await exchange.cancel_order(pos['sl_order_id'], sym)
                         await send_tg_msg(f"💰 <b>{clean_name} TP взят!</b>\nPNL: {pnl:+.2f} USD"); continue
                     except: pass
@@ -127,10 +123,20 @@ async def monitor_positions_task():
         except Exception as e: pass
         await asyncio.sleep(15)
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Kraken Async Bot Active")
+    def log_message(self, format, *args): return 
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler); server.serve_forever()
+
 async def main():
     init_db(); load_positions()
-    logging.info("🚀 Запуск KRAKEN ASYNC БОТА (PROP FIRM, Fixed Qty & Logic)...")
-    await send_tg_msg("🟢 <b>KRAKEN ASYNC БОТ</b> успешно запущен для PROP FIRM!")
+    logging.info("🚀 Запуск KRAKEN ASYNC БОТА (Risk: 0.5%, Max Pos: 3)...")
+    await send_tg_msg("🟢 <b>KRAKEN ASYNC БОТ</b> успешно запущен (Risk: 0.5%, Max Pos: 3)!")
+    from threading import Thread
+    Thread(target=run_server, daemon=True).start()
     asyncio.create_task(monitor_positions_task()) 
     while True: await asyncio.sleep(3600)
 
