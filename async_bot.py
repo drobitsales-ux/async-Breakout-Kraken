@@ -295,7 +295,10 @@ async def monitor_positions_task():
     global active_positions, daily_stats, COOLDOWN_CACHE
     while True:
         try:
-            if not active_positions: await asyncio.sleep(15); continue
+            if not active_positions: 
+                await asyncio.sleep(15)
+                continue
+                
             positions_raw = await exchange.fetch_positions()
             tickers = await exchange.fetch_tickers([p['symbol'] for p in active_positions])
             
@@ -314,12 +317,19 @@ async def monitor_positions_task():
                 if 'tp100_hit' not in pos: pos['tp100_hit'] = False
                 if 'atr' not in pos: pos['atr'] = abs(pos['entry_price'] - pos['sl_price']) * 0.5
                 if 'current_sl' not in pos: pos['current_sl'] = pos['sl_price']
+                if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
 
-                curr = next((r for r in positions_raw if r['symbol'] == sym and float(r.get('contracts', 0)) > 0), None)
+                curr = next((r for r in positions_raw if r['symbol'] == sym and abs(float(r.get('contracts', 0))) > 0), None)
                 ticker = tickers.get(sym, {}).get('last', pos['entry_price'])
                 sl_side = 'sell' if is_long else 'buy'
                 
                 if not curr:
+                    # ФИКС: Иммунитет 60 секунд от рассинхрона Kraken API
+                    seconds_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds()
+                    if seconds_passed < 60:
+                        updated.append(pos)
+                        continue
+
                     exit_price = pos['current_sl']
                     chunk_pnl = (exit_price - pos['entry_price']) * pos['current_qty'] * contract_size if is_long else (pos['entry_price'] - exit_price) * pos['current_qty'] * contract_size
                     daily_stats['trades'] = daily_stats.get('trades', 0) + 1
@@ -333,7 +343,6 @@ async def monitor_positions_task():
                         await send_tg_msg(f"🛡 <b>{clean_name} закрыта по Трейлингу/Б/У!</b>\nPNL: {chunk_pnl:+.2f} USD")
                     continue
 
-                if 'open_time' not in pos: pos['open_time'] = datetime.now(timezone.utc).isoformat()
                 hours_passed = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['open_time'])).total_seconds() / 3600
                 pnl = (ticker - pos['entry_price']) * pos['current_qty'] * contract_size if is_long else (pos['entry_price'] - ticker) * pos['current_qty'] * contract_size
 
@@ -417,7 +426,7 @@ async def monitor_positions_task():
                             pos.update({'sl_order_id': new_sl['id'], 'current_sl': trail_sl})
                         except: pass
 
-                updated.append(pos)
+            updated.append(pos)
             active_positions = updated; await asyncio.to_thread(save_positions)
         except Exception as e: pass
         await asyncio.sleep(15)
