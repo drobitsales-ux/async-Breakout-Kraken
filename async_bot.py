@@ -12,28 +12,29 @@ from datetime import datetime, timezone
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# Настройки БД и API
 DB_PATH = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
-
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GROUP_CHAT_ID = -1003955653290
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
 KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
-# НАСТРОЙКИ РИСКА ДЛЯ ПРОП-КОМПАНИИ
-RISK_PER_TRADE = 0.005      # 0.5% риска на сделку (безопасно для Prop)
+# Риск-менеджмент и лимиты
+RISK_PER_TRADE = 0.02       
 MAX_POSITIONS = 3           
-LEVERAGE = 5                # Безопасное плечо для Prop-счетов
-MIN_VOLUME_USD = 1000000    
+LEVERAGE = 10               
+SCAN_LIMIT = 150            # Динамический выбор Топ-150 пар
 MIN_SL_PCT = 1.5            
 MAX_SL_PCT = 6.0            
-
 SMC_TIMEFRAME = '15m'
-COOLDOWN_CACHE = {}         
-SCAN_LIMIT = 300           
 
+COOLDOWN_CACHE = {}         
 EXCLUDED_KEYWORDS = [
-    'FART', 'PEPE', 'SHIB', 'DOGE', 'WIF', 'BONK', 'FLOKI', 'BOME',
-    'MEME', 'TURBO', 'SATS', 'RATS', 'ORDI', 'PEOPLE'
+    'BTC/USD', 'ETH/USD', 'SOL/USD', 'BNB/USD', 'XRP/USD', 
+    'NCS', 'NCFX', 'NCCO', 'NCSI', 'NIKKEI', 'NASDAQ', 'SP500', 
+    'GOLD', 'SILVER', 'AUT', 'XAU', 'PAXG', 'EUR', '1000', 'LUNC', 
+    'USTC', 'USDC', 'FART', 'PEPE', 'SHIB', 'DOGE', 'WIF', 'BONK', 
+    'FLOKI', 'BOME', 'MEME', 'TURBO', 'SATS', 'RATS', 'ORDI', 'PEOPLE'
 ]
 
 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': 0.0, 'start_balance': 0.0, 'gross_profit': 0.0, 'gross_loss': 0.0}
@@ -43,14 +44,14 @@ REPORTED_TODAY = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
-# Подключение Kraken Futures
+# Подключение к Kraken Futures
 exchange = ccxt_async.krakenfutures({
     'apiKey': KRAKEN_API_KEY, 
     'secret': KRAKEN_SECRET,
     'enableRateLimit': True
 })
 
-# Оракулы глобального объема
+# Оракулы для подтверждения пробоев
 ORACLES = [
     ccxt_async.binance({'enableRateLimit': True}),
     ccxt_async.bybit({'enableRateLimit': True}),
@@ -163,7 +164,7 @@ async def safe_create_order(sym, order_type, side, qty, params):
         return await exchange.create_order(sym, order_type, side, qty, params=params)
     except Exception as e:
         error_msg = str(e)
-        if "reduceOnly" in error_msg.lower():
+        if "reduceonly" in error_msg.lower() or "reduceOnly" in error_msg:
             clean_params = {k: v for k, v in params.items() if k.lower() != 'reduceonly'}
             return await exchange.create_order(sym, order_type, side, qty, params=clean_params)
         raise e
@@ -191,18 +192,23 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
             
         risk_amount = free_usd * RISK_PER_TRADE
         
-        # Специфика Kraken: учет Contract Size
         market = exchange.markets.get(sym, {})
         contract_size = float(market.get('contractSize', 1.0))
         
         qty_coins = risk_amount / actual_sl_dist
+        max_margin_lock = free_usd * 0.15 
+        max_notional_usd = max_margin_lock * LEVERAGE
+        target_notional = qty_coins * current_price
+        
+        if target_notional > max_notional_usd: qty_coins = max_notional_usd / current_price
+        
+        # Объем для Kraken (с учетом contractSize)
         qty = float(exchange.amount_to_precision(sym, qty_coins / contract_size if contract_size > 0 else qty_coins))
         if qty <= 0: return
         
         try: await exchange.set_leverage(LEVERAGE, sym)
         except: pass
         
-        # Удален positionSide, только базовое направление
         side = 'buy' if direction == 'Long' else 'sell'
         sl_side = 'sell' if direction == 'Long' else 'buy'
         
@@ -214,7 +220,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
 
     sl_id = None
     try:
-        # Kraken Futures использует stopPrice
+        # Для Kraken используем stopPrice
         sl_ord = await safe_create_order(sym, 'stop_market', sl_side, qty, {'stopPrice': sl_price, 'reduceOnly': True})
         sl_id = sl_ord['id']
     except Exception as e:
@@ -284,7 +290,7 @@ async def execute_trade(sym, signal_data, strategy_name="SMC Async"):
                           f"• Всплеск объема: {signal_data.get('vol_ratio', 0):.1f}x от среднего\n"
                           f"• Размер пробойной свечи: {signal_data.get('candle_size', 0):.2f}%")
 
-    msg = (f"💥 <b>ВЫСТРЕЛ [KRAKEN {strategy_name} v8.45]: {clean_sym}</b>{oracle_text}\n"
+    msg = (f"💥 <b>ВЫСТРЕЛ [{strategy_name} KRAKEN]: {clean_sym}</b>{oracle_text}\n"
            f"Направление: <b>#{direction}</b>\nЦена: {current_price}\n"
            f"Объем (контр.): {qty}\nSL: {sl_price} ({sl_pct:.2f}%)\n"
            f"Smart TP Цель: {tp_price}\n\n{analytics_text}")
@@ -479,7 +485,6 @@ async def process_smc_coin(sym, ctx, sem):
             if mode == 'Long' and current_price < vwap: return sym, 'vwap_reject'
             if mode == 'Short' and current_price > vwap: return sym, 'vwap_reject'
             
-            # --- ИСПРАВЛЕННЫЕ СНАЙПЕРСКИЕ ФИЛЬТРЫ V8.45 ---
             confirm_type = ""
             if mode == 'Long':
                 if not is_green_candle: return sym, 'no_confirm'
@@ -518,7 +523,8 @@ async def smc_radar_task():
     await exchange.load_markets() 
     while True:
         try:
-            if len(active_positions) >= MAX_POSITIONS: await asyncio.sleep(60); continue
+            if len(active_positions) >= MAX_POSITIONS: 
+                await asyncio.sleep(60); continue
             
             btc_trend = 'Long'
             altseason = False
@@ -546,39 +552,41 @@ async def smc_radar_task():
             except: pass
             
             global_ctx = {
-                'btc_trend': btc_trend,
-                'btc_ema_dist': btc_ema_dist,
-                'altseason': altseason,
-                'eth_btc_diff': eth_btc_diff
+                'btc_trend': btc_trend, 'btc_ema_dist': btc_ema_dist,
+                'altseason': altseason, 'eth_btc_diff': eth_btc_diff
             }
 
             tickers = await exchange.fetch_tickers()
             temp_symbols = []
+            
             for sym, tick in tickers.items():
                 clean_sym = sym.split(':')[0].split('/')[0]
-                if exchange.markets.get(sym, {}).get('active') is False: continue
+                market = exchange.markets.get(sym, {})
+                
+                if market.get('active') is False: continue
                 if not (sym.endswith('USD') or sym.endswith('USDT')): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 if clean_sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[clean_sym]: continue
                 if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
                 
-                # ФИКС КРАКЕНА: Умный подсчет объема
                 q_vol = tick.get('quoteVolume')
                 if not q_vol:
                     base_vol = tick.get('baseVolume', 0)
                     last_price = tick.get('last', 0)
                     q_vol = float(base_vol) * float(last_price) if base_vol and last_price else 0
-                
+                    
                 temp_symbols.append((sym, float(q_vol)))
             
             stats = {'total': len(tickers), 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_falling': 0, 'rsi_exhausted': 0, 'passed': 0}
             
-            # ФИКС: Сортируем монеты по ликвидности и берем самые объемные (безопаснее жесткого лимита)
-            valid_symbols_data = [sym for sym, vol in sorted(temp_symbols, key=lambda x: x[1], reverse=True)][:SCAN_LIMIT]
+            # Динамическая сортировка и выбор Топ-150 пар
+            sorted_symbols = sorted(temp_symbols, key=lambda x: x[1], reverse=True)[:SCAN_LIMIT]
+            valid_symbols_data = [sym for sym, vol in sorted_symbols]
             
-            logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'})...")
+            logging.info(f"⏳ [SMC РАДАР] Опрос Топ-{len(valid_symbols_data)} монет по объему (Альтсезон: {'ON' if altseason else 'OFF'})...")
             
-            sem = asyncio.Semaphore(10); tasks = [process_smc_coin(s, global_ctx, sem) for s in valid_symbols_data]
+            sem = asyncio.Semaphore(10)
+            tasks = [process_smc_coin(s, global_ctx, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             valid_results = []
@@ -649,34 +657,40 @@ async def grid_radar_task():
     await asyncio.sleep(30) 
     while True:
         try:
-            if len(active_positions) >= MAX_POSITIONS: await asyncio.sleep(60); continue
+            if len(active_positions) >= MAX_POSITIONS: 
+                await asyncio.sleep(60); continue
+            
             tickers = await exchange.fetch_tickers()
             temp_symbols = []
+            
             for sym, tick in tickers.items():
                 clean_sym = sym.split(':')[0].split('/')[0]
-                if exchange.markets.get(sym, {}).get('active') is False: continue
+                market = exchange.markets.get(sym, {})
+                
+                if market.get('active') is False: continue
                 if not (sym.endswith('USD') or sym.endswith('USDT')): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 if clean_sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[clean_sym]: continue
                 if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
                 
-                # ФИКС КРАКЕНА: Умный подсчет объема
                 q_vol = tick.get('quoteVolume')
                 if not q_vol:
                     base_vol = tick.get('baseVolume', 0)
                     last_price = tick.get('last', 0)
                     q_vol = float(base_vol) * float(last_price) if base_vol and last_price else 0
-                
+                    
                 temp_symbols.append((sym, float(q_vol)))
             
             stats = {'vol_fail': 0, 'price_fail': 0, 'oracle_reject': 0, 'passed': 0}
             
-            # ФИКС: Сортируем монеты по ликвидности
-            valid_symbols_data = [sym for sym, vol in sorted(temp_symbols, key=lambda x: x[1], reverse=True)][:SCAN_LIMIT]
+            # Динамическая сортировка и выбор Топ-150 пар
+            sorted_symbols = sorted(temp_symbols, key=lambda x: x[1], reverse=True)[:SCAN_LIMIT]
+            valid_symbols_data = [sym for sym, vol in sorted_symbols]
             
-            logging.info(f"⏳ [GRID РАДАР] Опрос {len(valid_symbols_data)} монет...")
+            logging.info(f"⏳ [GRID РАДАР] Опрос Топ-{len(valid_symbols_data)} монет по объему...")
             
-            sem = asyncio.Semaphore(10); tasks = [process_grid_coin(s, sem) for s in valid_symbols_data]
+            sem = asyncio.Semaphore(10)
+            tasks = [process_grid_coin(s, sem) for s in valid_symbols_data]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             valid_results = []
@@ -710,7 +724,9 @@ async def print_stats_hourly():
                 start_bal = daily_stats.get('start_balance', 0.0)
                 pct_change = ((current_balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (KRAKEN Async v8.45):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USD\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USD\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                
+                await send_tg_msg(f"🗓 <b>ИТОГИ ДНЯ (KRAKEN Async DUAL):</b> {now.strftime('%d.%m.%Y')}\n\n📉 Закрыто сделок: {daily_stats['trades']}\n🎯 Винрейт: {winrate:.1f}%\n💵 Net PNL: {daily_stats['pnl']:+.2f} USD\n\n🏦 <b>Баланс:</b> {current_balance:.2f} USD\n📊 <b>Изменение:</b> {pct_change:+.2f}%\n<i>*В работе: {len(active_positions)}</i>")
+                
                 daily_stats = {'pnl': 0.0, 'trades': 0, 'wins': 0, 'prev_winrate': winrate, 'start_balance': current_balance, 'gross_profit': 0.0, 'gross_loss': 0.0}
                 await asyncio.to_thread(save_positions); REPORTED_TODAY = True
             elif now.hour != 20: REPORTED_TODAY = False
@@ -718,12 +734,12 @@ async def print_stats_hourly():
             if now.minute == 0:
                 active = ", ".join([p['symbol'].split(':')[0].split('/')[0] for p in active_positions]) or "Нет"
                 winrate = (daily_stats['wins'] / daily_stats['trades'] * 100) if daily_stats['trades'] > 0 else 0
-                logging.info(f"📊 [ТЕЛЕМЕТРИЯ v8.45 KRAKEN] В работе: {active} | Винрейт: {winrate:.1f}%")
+                logging.info(f"📊 [ТЕЛЕМЕТРИЯ KRAKEN] В работе: {active} | Винрейт: {winrate:.1f}%")
         except: pass
         await asyncio.sleep(60)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Kraken Prop Async Bot Active v8.45")
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"Kraken Async Bot Active")
     def log_message(self, format, *args): return 
 
 def run_server():
@@ -738,8 +754,8 @@ async def main():
             await asyncio.to_thread(save_positions)
         except: pass
         
-    logging.info("🚀 Запуск KRAKEN ASYNC БОТА v8.45 (Sniper Unchained for Prop)...")
-    await send_tg_msg("🟢 <b>KRAKEN ASYNC БОТ v8.45</b> запущен (Полный порт логики BingX на архитектуру Kraken)!")
+    logging.info("🚀 Запуск KRAKEN ASYNC БОТА (Sniper + Grid, Dynamic Top-150)...")
+    await send_tg_msg("🟢 <b>KRAKEN ASYNC БОТ</b> запущен (Исправлен баг «потери» позиций, включена сортировка Топ-150 пар)!")
     Thread(target=run_server, daemon=True).start()
     
     asyncio.create_task(monitor_positions_task())
