@@ -547,16 +547,25 @@ async def smc_radar_task():
             temp_symbols = []
             for sym, tick in tickers.items():
                 clean_sym = sym.split(':')[0].split('/')[0]
-                # Kraken фильтр линейных и инверсных контрактов
                 if exchange.markets.get(sym, {}).get('active') is False: continue
                 if not (sym.endswith('USD') or sym.endswith('USDT')): continue
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 if clean_sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[clean_sym]: continue
                 if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
-                temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
+                
+                # ФИКС КРАКЕНА: Умный подсчет объема
+                q_vol = tick.get('quoteVolume')
+                if not q_vol:
+                    base_vol = tick.get('baseVolume', 0)
+                    last_price = tick.get('last', 0)
+                    q_vol = float(base_vol) * float(last_price) if base_vol and last_price else 0
+                
+                temp_symbols.append((sym, float(q_vol)))
             
             stats = {'total': len(tickers), 'no_choch': 0, 'no_fvg': 0, 'no_volume': 0, 'wrong_trend': 0, 'vwap_reject': 0, 'overextended': 0, 'no_confirm': 0, 'rsi_falling': 0, 'rsi_exhausted': 0, 'passed': 0}
-            valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USD][:SCAN_LIMIT]
+            
+            # ФИКС: Сортируем монеты по ликвидности и берем самые объемные (безопаснее жесткого лимита)
+            valid_symbols_data = [sym for sym, vol in sorted(temp_symbols, key=lambda x: x[1], reverse=True)][:SCAN_LIMIT]
             
             logging.info(f"⏳ [SMC РАДАР] Опрос {len(valid_symbols_data)} монет (Альтсезон: {'ON' if altseason else 'OFF'})...")
             
@@ -641,10 +650,20 @@ async def grid_radar_task():
                 if any(kw in sym.upper() for kw in EXCLUDED_KEYWORDS): continue
                 if clean_sym in COOLDOWN_CACHE and time.time() < COOLDOWN_CACHE[clean_sym]: continue
                 if any(pos['symbol'].split(':')[0].split('/')[0] == clean_sym for pos in active_positions): continue
-                temp_symbols.append((sym, float(tick.get('quoteVolume') or 0)))
+                
+                # ФИКС КРАКЕНА: Умный подсчет объема
+                q_vol = tick.get('quoteVolume')
+                if not q_vol:
+                    base_vol = tick.get('baseVolume', 0)
+                    last_price = tick.get('last', 0)
+                    q_vol = float(base_vol) * float(last_price) if base_vol and last_price else 0
+                
+                temp_symbols.append((sym, float(q_vol)))
             
             stats = {'vol_fail': 0, 'price_fail': 0, 'oracle_reject': 0, 'passed': 0}
-            valid_symbols_data = [sym for sym, vol in temp_symbols if vol >= MIN_VOLUME_USD][:SCAN_LIMIT]
+            
+            # ФИКС: Сортируем монеты по ликвидности
+            valid_symbols_data = [sym for sym, vol in sorted(temp_symbols, key=lambda x: x[1], reverse=True)][:SCAN_LIMIT]
             
             logging.info(f"⏳ [GRID РАДАР] Опрос {len(valid_symbols_data)} монет...")
             
