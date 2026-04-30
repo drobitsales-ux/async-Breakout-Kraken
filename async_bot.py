@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 DB_PATH = '/data/bot.db' if os.path.exists('/data') else 'bot.db'
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID', -1003407154454))
+GROUP_CHAT_ID = -1003955653290
 KRAKEN_API_KEY = os.getenv('KRAKEN_API_KEY')
 KRAKEN_SECRET = os.getenv('KRAKEN_SECRET')
 
